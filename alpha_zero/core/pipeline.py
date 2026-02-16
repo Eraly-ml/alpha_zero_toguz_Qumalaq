@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-torch.autograd.set_detect_anomaly(True)
+torch.backends.cudnn.benchmark = True
 
 import numpy as np
 from copy import copy, deepcopy
@@ -100,10 +100,11 @@ def create_mcts_player(
             state = state[None, ...]
 
         state = torch.from_numpy(state).to(dtype=torch.float32, device=device, non_blocking=True)
-        pi_logits, v = network(state)
+        with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+            pi_logits, v = network(state)
 
-        pi_logits = torch.detach(pi_logits)
-        v = torch.detach(v)
+        pi_logits = torch.detach(pi_logits).float()
+        v = torch.detach(v).float()
 
         pi = torch.softmax(pi_logits, dim=-1).cpu().numpy()
         v = v.cpu().numpy()
