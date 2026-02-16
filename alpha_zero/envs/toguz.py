@@ -38,6 +38,126 @@ NORMALIZATION_FACTOR = float(TOTAL_STONES)
 PLAYER_1 = 0  # "Black" - moves first
 PLAYER_2 = 1  # "White"
 
+# Pre-computed lookup table for next position: (row, col) -> (next_row, next_col)
+# Flattened as: index = row * 9 + col, value = (next_row, next_col)
+_NEXT_ROW = np.empty(18, dtype=np.int32)
+_NEXT_COL = np.empty(18, dtype=np.int32)
+for _r in range(2):
+    for _c in range(NUM_PITS):
+        _idx = _r * NUM_PITS + _c
+        if _c < NUM_PITS - 1:
+            _NEXT_ROW[_idx] = _r
+            _NEXT_COL[_idx] = _c + 1
+        else:
+            _NEXT_ROW[_idx] = 1 - _r
+            _NEXT_COL[_idx] = 0
+
+# ============================================================
+# Numba JIT-compiled core game logic
+# ============================================================
+try:
+    from numba import njit
+
+    @njit(cache=True)
+    def _sow_stones_jit(board, kazans, tuzduks, player, opponent, pit, next_row_lut, next_col_lut):
+        """JIT-compiled stone sowing with capture and tuzdyk logic."""
+        stones = board[player, pit]
+        board[player, pit] = 0
+
+        if stones == 0:
+            return
+
+        if stones == 1:
+            idx = player * 9 + pit
+            row = next_row_lut[idx]
+            col = next_col_lut[idx]
+            board[row, col] += 1
+            if row == opponent:
+                count = board[opponent, col]
+                if count == 3:
+                    if tuzduks[player] == -1 and col != 8 and tuzduks[opponent] != col:
+                        tuzduks[player] = col
+                        kazans[player] += board[opponent, col]
+                        board[opponent, col] = 0
+                        return
+                if count % 2 == 0 and count > 0:
+                    kazans[player] += count
+                    board[opponent, col] = 0
+            return
+
+        # General case: keep one stone in origin
+        board[player, pit] = 1
+        stones -= 1
+
+        current_row = player
+        current_col = pit
+        for _ in range(stones):
+            idx = current_row * 9 + current_col
+            current_row = next_row_lut[idx]
+            current_col = next_col_lut[idx]
+            board[current_row, current_col] += 1
+
+        if current_row == opponent:
+            count = board[opponent, current_col]
+            if count == 3:
+                if tuzduks[player] == -1 and current_col != 8 and tuzduks[opponent] != current_col:
+                    tuzduks[player] = current_col
+                    kazans[player] += board[opponent, current_col]
+                    board[opponent, current_col] = 0
+                    return
+            if count % 2 == 0 and count > 0:
+                kazans[player] += count
+                board[opponent, current_col] = 0
+
+    @njit(cache=True)
+    def _update_legal_actions_jit(board, tuzduks, player, opponent, legal_actions):
+        """JIT-compiled legal actions update."""
+        for i in range(9):
+            if board[player, i] > 0 and tuzduks[opponent] != i:
+                legal_actions[i] = 1
+            else:
+                legal_actions[i] = 0
+
+    @njit(cache=True)
+    def _build_observation_jit(obs, boards, kazans_arr, tuzduks_arr, player, opponent, is_black, num_stack):
+        """JIT-compiled observation builder — single allocation, no Python overhead."""
+        norm = 162.0
+        for h in range(num_stack):
+            base = h * 6
+            for j in range(9):
+                obs[base, 0, j] = boards[h, player, j] / norm
+                obs[base, 1, j] = 0.0
+                obs[base + 1, 0, j] = 0.0
+                obs[base + 1, 1, j] = boards[h, opponent, j] / norm
+            kp = kazans_arr[h, player] / norm
+            ko = kazans_arr[h, opponent] / norm
+            for j in range(9):
+                obs[base + 2, 0, j] = kp
+                obs[base + 2, 1, j] = kp
+                obs[base + 3, 0, j] = ko
+                obs[base + 3, 1, j] = ko
+                obs[base + 4, 0, j] = 0.0
+                obs[base + 4, 1, j] = 0.0
+                obs[base + 5, 0, j] = 0.0
+                obs[base + 5, 1, j] = 0.0
+            tp = tuzduks_arr[h, player]
+            if tp >= 0:
+                obs[base + 4, 1, tp] = 1.0
+            to = tuzduks_arr[h, opponent]
+            if to >= 0:
+                obs[base + 5, 0, to] = 1.0
+        # Color to play plane (last plane)
+        last = num_stack * 6
+        val = 1.0 if is_black else 0.0
+        for j in range(9):
+            obs[last, 0, j] = val
+            obs[last, 1, j] = val
+
+    _HAS_NUMBA = True
+
+except ImportError:
+    _HAS_NUMBA = False
+
 
 class ToguzKumalakEnv(BoardGameEnv):
     """Togyz Kumalak Environment with OpenAI Gym API.
@@ -93,6 +213,13 @@ class ToguzKumalakEnv(BoardGameEnv):
         # Maximum steps to prevent infinite games
         self.max_steps = 500
 
+        # Pre-allocate observation buffer (reused across calls)
+        self._obs_buffer = np.zeros((num_channels, 2, NUM_PITS), dtype=np.float32)
+        # Pre-allocate structured history arrays for JIT observation builder
+        self._hist_boards = np.zeros((num_stack, 2, NUM_PITS), dtype=np.int32)
+        self._hist_kazans = np.zeros((num_stack, 2), dtype=np.int32)
+        self._hist_tuzduks = np.full((num_stack, 2), -1, dtype=np.int32)
+
     def reset(self, **kwargs) -> np.ndarray:
         """Reset game to initial state."""
         # Don't call super().reset() as it resets to NxN board
@@ -113,14 +240,7 @@ class ToguzKumalakEnv(BoardGameEnv):
         return self.observation()
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, dict]:
-        """Play one move.
-
-        Args:
-            action: pit index (0-8) to play from current player's side.
-
-        Returns:
-            observation, reward, done, info
-        """
+        """Play one move."""
         if self.is_game_over():
             raise RuntimeError('Game is over, call reset before using step method.')
         if not 0 <= int(action) <= NUM_PITS - 1:
@@ -128,8 +248,8 @@ class ToguzKumalakEnv(BoardGameEnv):
         if self.legal_actions[int(action)] != 1:
             raise ValueError(f'Illegal action {action}.')
 
-        self.last_move = copy(int(action))
-        self.last_player = copy(self.to_play)
+        self.last_move = int(action)
+        self.last_player = self.to_play
         self.steps += 1
 
         self.add_to_history(self.last_player, self.last_move)
@@ -139,7 +259,10 @@ class ToguzKumalakEnv(BoardGameEnv):
         opponent = 1 - player
 
         # Execute the move
-        self._sow_stones(player, opponent, int(action))
+        if _HAS_NUMBA:
+            _sow_stones_jit(self.board, self.kazans, self.tuzduks, player, opponent, int(action), _NEXT_ROW, _NEXT_COL)
+        else:
+            self._sow_stones(player, opponent, int(action))
 
         # Save board state to history
         self.board_history.appendleft(self._snapshot())
@@ -162,16 +285,20 @@ class ToguzKumalakEnv(BoardGameEnv):
         self.to_play = self.opponent_player
 
         # Update legal actions for next player
-        self._update_legal_actions()
+        if _HAS_NUMBA:
+            next_player = self._player_index(self.to_play)
+            next_opponent = 1 - next_player
+            _update_legal_actions_jit(self.board, self.tuzduks, next_player, next_opponent, self.legal_actions)
+        else:
+            self._update_legal_actions()
 
         # Check if next player has no legal moves
         if not done and np.sum(self.legal_actions) == 0:
             next_player = self._player_index(self.to_play)
             next_opponent = 1 - next_player
-            # All remaining opponent stones go to opponent's kazan
+            # All remaining stones go to respective kazans
             self.kazans[next_player] += np.sum(self.board[next_player])
             self.board[next_player] = 0
-            # Also give opponent their remaining stones
             self.kazans[next_opponent] += np.sum(self.board[next_opponent])
             self.board[next_opponent] = 0
             self._determine_winner_by_kazans()
@@ -180,7 +307,7 @@ class ToguzKumalakEnv(BoardGameEnv):
         return self.observation(), reward, done, {}
 
     def _sow_stones(self, player: int, opponent: int, pit: int) -> None:
-        """Execute stone sowing, capture, and tuzdyk logic."""
+        """Execute stone sowing, capture, and tuzdyk logic (pure Python fallback)."""
         stones = self.board[player, pit]
         self.board[player, pit] = 0
 
@@ -189,9 +316,8 @@ class ToguzKumalakEnv(BoardGameEnv):
 
         # Special case: if only 1 stone, move it to the next pit
         if stones == 1:
-            # Next pit in counter-clockwise order
-            next_pos = self._next_position(player, pit)
-            row, col = next_pos
+            idx = player * NUM_PITS + pit
+            row, col = _NEXT_ROW[idx], _NEXT_COL[idx]
             self.board[row, col] += 1
 
             # Check for tuzdyk and capture only in opponent's pits
@@ -206,7 +332,8 @@ class ToguzKumalakEnv(BoardGameEnv):
 
         current_row, current_col = player, pit
         for i in range(stones):
-            current_row, current_col = self._next_position(current_row, current_col)
+            idx = current_row * NUM_PITS + current_col
+            current_row, current_col = _NEXT_ROW[idx], _NEXT_COL[idx]
             self.board[current_row, current_col] += 1
 
         # After sowing, check if last stone landed in opponent's pit
@@ -232,30 +359,18 @@ class ToguzKumalakEnv(BoardGameEnv):
 
     def _can_create_tuzdyk(self, player: int, opponent: int, pit: int) -> bool:
         """Check if player can create a tuzdyk at opponent's pit."""
-        # Player already has a tuzdyk
         if self.tuzduks[player] != -1:
             return False
-
-        # Cannot make the 9th pit (index 8) a tuzdyk
         if pit == NUM_PITS - 1:
             return False
-
-        # Symmetry rule: both players cannot have tuzdyk at the same index
         if self.tuzduks[opponent] == pit:
             return False
-
         return True
 
     def _next_position(self, row: int, col: int) -> Tuple[int, int]:
-        """Get next position in counter-clockwise sowing order.
-
-        Order: P1[0]->P1[1]->...->P1[8]->P2[0]->P2[1]->...->P2[8]->P1[0]->...
-        """
-        if col < NUM_PITS - 1:
-            return (row, col + 1)
-        else:
-            # Wrap to the other player's side
-            return (1 - row, 0)
+        """Get next position in counter-clockwise sowing order."""
+        idx = row * NUM_PITS + col
+        return _NEXT_ROW[idx], _NEXT_COL[idx]
 
     def _check_win_conditions(self, player: int, opponent: int) -> None:
         """Check if the game has been won."""
@@ -278,75 +393,54 @@ class ToguzKumalakEnv(BoardGameEnv):
             self.winner = -1  # Draw
 
     def _update_legal_actions(self) -> None:
-        """Update legal actions for the current player."""
+        """Update legal actions for the current player (pure Python fallback)."""
         player = self._player_index(self.to_play)
         opponent = 1 - player
         self.legal_actions = np.zeros(NUM_PITS, dtype=np.int8)
 
         for i in range(NUM_PITS):
-            # A pit is legal if it has stones and is not the opponent's tuzdyk on our side
             if self.board[player, i] > 0:
-                # Check if this pit is captured as opponent's tuzdyk
                 if self.tuzduks[opponent] != i:
                     self.legal_actions[i] = 1
 
     def observation(self) -> np.ndarray:
-        """Create observation tensor with shape (C, 2, 9).
-
-        Feature planes per history step (6 planes):
-            0: Current player's pit counts (normalized)
-            1: Opponent's pit counts (normalized)
-            2: Current player's kazan (broadcast, normalized)
-            3: Opponent's kazan (broadcast, normalized)
-            4: Current player's tuzdyk mask (binary on opponent's pits)
-            5: Opponent's tuzdyk mask (binary on current player's pits)
-        Plus 1 color-to-play plane.
-        """
+        """Create observation tensor with shape (C, 2, 9). Single allocation."""
         player = self._player_index(self.to_play)
         opponent = 1 - player
 
-        planes = []
+        if _HAS_NUMBA:
+            # Pack history into contiguous arrays for JIT
+            for h, (board_snap, kazans_snap, tuzduks_snap) in enumerate(self.board_history):
+                self._hist_boards[h] = board_snap
+                self._hist_kazans[h] = kazans_snap
+                self._hist_tuzduks[h] = tuzduks_snap
 
-        for snapshot in self.board_history:
-            board_snap, kazans_snap, tuzduks_snap = snapshot
+            self._obs_buffer[:] = 0.0
+            _build_observation_jit(
+                self._obs_buffer, self._hist_boards, self._hist_kazans, self._hist_tuzduks,
+                player, opponent, self.to_play == self.black_player, self.num_stack,
+            )
+            return np.copy(self._obs_buffer)
 
-            # Create 6 feature planes, each of shape (2, 9)
-            # Plane 0: current player's pits
-            p0 = np.zeros((2, NUM_PITS), dtype=np.float32)
-            p0[0] = board_snap[player] / NORMALIZATION_FACTOR
-            p0[1] = 0  # opponent row is zero in this plane
+        # Fallback: single-allocation without numba
+        num_ch = self.num_stack * 6 + 1
+        obs = np.zeros((num_ch, 2, NUM_PITS), dtype=np.float32)
 
-            # Plane 1: opponent's pits
-            p1 = np.zeros((2, NUM_PITS), dtype=np.float32)
-            p1[0] = 0
-            p1[1] = board_snap[opponent] / NORMALIZATION_FACTOR
-
-            # Plane 2: current player kazan (broadcast)
-            p2 = np.full((2, NUM_PITS), kazans_snap[player] / NORMALIZATION_FACTOR, dtype=np.float32)
-
-            # Plane 3: opponent kazan (broadcast)
-            p3 = np.full((2, NUM_PITS), kazans_snap[opponent] / NORMALIZATION_FACTOR, dtype=np.float32)
-
-            # Plane 4: current player's tuzdyk (on opponent's pits)
-            p4 = np.zeros((2, NUM_PITS), dtype=np.float32)
+        for h, (board_snap, kazans_snap, tuzduks_snap) in enumerate(self.board_history):
+            base = h * 6
+            obs[base, 0] = board_snap[player] / NORMALIZATION_FACTOR
+            obs[base + 1, 1] = board_snap[opponent] / NORMALIZATION_FACTOR
+            obs[base + 2] = kazans_snap[player] / NORMALIZATION_FACTOR
+            obs[base + 3] = kazans_snap[opponent] / NORMALIZATION_FACTOR
             if tuzduks_snap[player] >= 0:
-                p4[1, tuzduks_snap[player]] = 1.0  # mark on opponent's row
-
-            # Plane 5: opponent's tuzdyk (on current player's pits)
-            p5 = np.zeros((2, NUM_PITS), dtype=np.float32)
+                obs[base + 4, 1, tuzduks_snap[player]] = 1.0
             if tuzduks_snap[opponent] >= 0:
-                p5[0, tuzduks_snap[opponent]] = 1.0  # mark on current player's row
+                obs[base + 5, 0, tuzduks_snap[opponent]] = 1.0
 
-            planes.extend([p0, p1, p2, p3, p4, p5])
-
-        # Color to play plane
-        color_plane = np.zeros((2, NUM_PITS), dtype=np.float32)
         if self.to_play == self.black_player:
-            color_plane[:] = 1.0
+            obs[-1] = 1.0
 
-        planes.append(color_plane)
-
-        return np.array(planes, dtype=np.float32)
+        return obs
 
     def _snapshot(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Create a snapshot of current board state."""
@@ -518,4 +612,9 @@ class ToguzKumalakEnv(BoardGameEnv):
             maxlen=self.num_stack,
         )
         clone.history = list(self.history)
+        # Pre-allocated buffers for observation (shared shape, each clone gets its own)
+        clone._obs_buffer = np.zeros_like(self._obs_buffer)
+        clone._hist_boards = np.zeros_like(self._hist_boards)
+        clone._hist_kazans = np.zeros_like(self._hist_kazans)
+        clone._hist_tuzduks = np.full_like(self._hist_tuzduks, -1)
         return clone
