@@ -481,3 +481,41 @@ class ToguzKumalakEnv(BoardGameEnv):
         self.board_history.clear()
         del self.history[:]
         return super(BoardGameEnv, self).close()
+
+    def fast_clone(self):
+        """Fast shallow clone for MCTS simulation — avoids expensive copy.deepcopy.
+
+        Only copies mutable game state; skips gym.Env metadata, spaces, etc.
+        """
+        clone = object.__new__(self.__class__)
+        # Immutable / shared attrs (no copy needed)
+        clone.id = self.id
+        clone.board_size = self.board_size
+        clone.num_stack = self.num_stack
+        clone.black_player = self.black_player
+        clone.white_player = self.white_player
+        clone.has_pass_move = self.has_pass_move
+        clone.has_resign_move = self.has_resign_move
+        clone.pass_move = self.pass_move
+        clone.resign_move = self.resign_move
+        clone.action_dim = self.action_dim
+        clone.action_space = self.action_space
+        clone.observation_space = self.observation_space
+        clone.max_steps = self.max_steps
+        # Mutable game state (must copy)
+        clone.board = np.copy(self.board)
+        clone.kazans = np.copy(self.kazans)
+        clone.tuzduks = np.copy(self.tuzduks)
+        clone.legal_actions = np.copy(self.legal_actions)
+        clone.to_play = self.to_play
+        clone.steps = self.steps
+        clone.winner = self.winner
+        clone.last_player = self.last_player
+        clone.last_move = self.last_move
+        # History — shallow copy deque with copied arrays inside
+        clone.board_history = deque(
+            [(np.copy(b), np.copy(k), np.copy(t)) for b, k, t in self.board_history],
+            maxlen=self.num_stack,
+        )
+        clone.history = list(self.history)
+        return clone

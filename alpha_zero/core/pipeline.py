@@ -214,6 +214,14 @@ def run_selfplay_actor_loop(
 
     network.eval()
 
+    # Compile network for faster inference (fuses BatchNorm+ReLU, uses CUDA graphs internally)
+    if device.type == 'cuda':
+        try:
+            network = torch.compile(network, mode='reduce-overhead')
+            logger.debug(f'Actor{rank} compiled network with reduce-overhead mode')
+        except Exception as e:
+            logger.debug(f'Actor{rank} torch.compile failed, using eager mode: {e}')
+
     # resign_threshold <= -1 means no resign
     resign_threshold = var_resign_threshold.value if env.has_resign_move else -1
     mcts_player = create_mcts_player(
@@ -722,6 +730,15 @@ def run_evaluator_loop(
     disable_auto_grad(prev_ckpt_network)
     network.eval()
     prev_ckpt_network.eval()
+
+    # Compile eval networks for faster inference
+    if device.type == 'cuda':
+        try:
+            network = torch.compile(network, mode='reduce-overhead')
+            prev_ckpt_network = torch.compile(prev_ckpt_network, mode='reduce-overhead')
+            logger.debug('Evaluator compiled networks with reduce-overhead mode')
+        except Exception as e:
+            logger.debug(f'Evaluator torch.compile failed, using eager mode: {e}')
 
     dataloader = None
     if eval_games_dir is not None and eval_games_dir != '' and os.path.exists(eval_games_dir):

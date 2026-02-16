@@ -576,7 +576,7 @@ def parallel_uct_search(
             node = root_node
 
             # Make sure do not touch the actual environment.
-            sim_env = copy.deepcopy(env)
+            sim_env = env.fast_clone() if hasattr(env, 'fast_clone') else copy.deepcopy(env)
             obs = sim_env.observation()
             done = sim_env.is_game_over()
 
