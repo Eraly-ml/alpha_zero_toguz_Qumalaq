@@ -68,6 +68,31 @@ def load_from_file(file_name: str) -> Any:
     return pickle.load(open(file_name, 'rb'))
 
 
+def _unwrap_state_dict(state_dict):
+    """Strip '_orig_mod.' prefix from torch.compile'd state_dict keys."""
+    new_sd = {}
+    for k, v in state_dict.items():
+        new_sd[k.removeprefix('_orig_mod.')] = v
+    return new_sd
+
+
+def _load_state_dict_safe(network, state_dict):
+    """Load state_dict handling torch.compile prefix mismatch.
+
+    Saves always store raw (unwrapped) keys. When loading into a
+    compiled model we add the '_orig_mod.' prefix; when loading into
+    a plain model we strip it.
+    """
+    raw_sd = _unwrap_state_dict(state_dict)
+
+    # Check if network is a compiled (OptimizedModule) wrapper
+    if hasattr(network, '_orig_mod'):
+        wrapped_sd = {f'_orig_mod.{k}': v for k, v in raw_sd.items()}
+        network.load_state_dict(wrapped_sd)
+    else:
+        network.load_state_dict(raw_sd)
+
+
 def round_it(v, places=4) -> float:
     return round(v, places)
 
@@ -208,7 +233,7 @@ def run_selfplay_actor_loop(
 
     if load_ckpt is not None and os.path.exists(load_ckpt):
         loaded_state = torch.load(load_ckpt, map_location=device)
-        network.load_state_dict(loaded_state['network'])
+        _load_state_dict_safe(network, loaded_state['network'])
         training_steps = loaded_state['training_steps']
         logger.debug(f'Actor{rank} loaded state from checkpoint "{load_ckpt}"')
 
@@ -241,7 +266,7 @@ def run_selfplay_actor_loop(
         new_ckpt = _decode_bytes(var_ckpt.value)
         if new_ckpt != '' and new_ckpt != last_ckpt and os.path.exists(new_ckpt):
             loaded_state = torch.load(new_ckpt, map_location=torch.device(device))
-            network.load_state_dict(loaded_state['network'])
+            _load_state_dict_safe(network, loaded_state['network'])
             training_steps = loaded_state['training_steps']
             network.eval()
             last_ckpt = new_ckpt
@@ -481,7 +506,7 @@ def run_learner_loop(  # noqa: C901
 
     if load_ckpt is not None and os.path.exists(load_ckpt):
         loaded_state = torch.load(load_ckpt, map_location=device)
-        network.load_state_dict(loaded_state['network'])
+        _load_state_dict_safe(network, loaded_state['network'])
         optimizer.load_state_dict(loaded_state['optimizer'])
         lr_scheduler.load_state_dict(loaded_state['lr_scheduler'])
         training_steps = loaded_state['training_steps']
@@ -606,7 +631,7 @@ def run_learner_loop(  # noqa: C901
                 ckpt_file = os.path.join(ckpt_dir, f'training_steps_{training_steps}.ckpt')
                 torch.save(
                     {
-                        'network': network.state_dict(),
+                        'network': _unwrap_state_dict(network.state_dict()),
                         'optimizer': optimizer.state_dict(),
                         'lr_scheduler': lr_scheduler.state_dict(),
                         'training_steps': training_steps,
@@ -721,7 +746,7 @@ def run_evaluator_loop(
 
     if load_ckpt is not None and os.path.exists(load_ckpt):
         loaded_state = torch.load(load_ckpt, map_location=device)
-        network.load_state_dict(loaded_state['network'])
+        _load_state_dict_safe(network, loaded_state['network'])
         last_ckpt_step = loaded_state['training_steps']
         last_ckpt = load_ckpt
         logger.info(f'Evaluator loaded state from checkpoint "{load_ckpt}"')
@@ -783,7 +808,7 @@ def run_evaluator_loop(
         # Load states from checkpoint file
         loaded_state = torch.load(ckpt_file, map_location=torch.device(device))
         training_steps = loaded_state['training_steps']
-        network.load_state_dict(loaded_state['network'])
+        _load_state_dict_safe(network, loaded_state['network'])
         network.eval()
         last_ckpt = ckpt_file
 
@@ -820,7 +845,7 @@ def run_evaluator_loop(
                 f.close()
 
         # Switching to new model
-        prev_ckpt_network.load_state_dict(loaded_state['network'])
+        _load_state_dict_safe(prev_ckpt_network, loaded_state['network'])
         prev_ckpt_network.eval()
         # We assume the new model will be the same level as previous model, since they are pretty close
         white_elo = deepcopy(black_elo)
