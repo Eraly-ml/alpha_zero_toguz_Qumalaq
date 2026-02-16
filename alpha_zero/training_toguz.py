@@ -143,6 +143,14 @@ flags.DEFINE_string('load_replay', '', 'Resume training by loading saved replay 
 flags.DEFINE_string('log_level', 'INFO', '')
 flags.DEFINE_integer('seed', 1, 'Seed the runtime.')
 
+flags.DEFINE_string(
+    'hf_repo_id',
+    '',
+    'Hugging Face Hub repo ID to upload weights to, e.g. "username/toguz-kumalak-alphazero". Empty to skip.',
+)
+flags.DEFINE_bool('upload_to_git', False, 'Commit and push the final checkpoint to the git repository.')
+flags.DEFINE_string('git_branch', '', 'Git branch to push weights to. Empty uses current branch.')
+
 flags.register_validator('num_simulations', lambda x: x > 1)
 flags.register_validator('init_resign_threshold', lambda x: x <= -1)
 flags.register_validator('log_level', lambda x: x in ['INFO', 'DEBUG'])
@@ -166,6 +174,7 @@ from alpha_zero.core.pipeline import (
 from alpha_zero.core.network import AlphaZeroNet
 from alpha_zero.core.replay import UniformReplay
 from alpha_zero.utils.util import extract_args_from_flags_dict, create_logger
+from alpha_zero.utils.upload_weights import upload_to_huggingface, upload_to_git_repo
 
 
 def main():
@@ -334,6 +343,18 @@ def main():
             actor.close()
 
         evaluator.join()
+
+    # Upload weights after training completes
+    if FLAGS.hf_repo_id:
+        logger.info(f'Uploading weights to Hugging Face Hub: {FLAGS.hf_repo_id}')
+        upload_to_huggingface(FLAGS.ckpt_dir, FLAGS.hf_repo_id)
+
+    if FLAGS.upload_to_git:
+        logger.info('Uploading weights to git repository')
+        upload_to_git_repo(
+            FLAGS.ckpt_dir,
+            branch=FLAGS.git_branch or None,
+        )
 
 
 if __name__ == '__main__':
