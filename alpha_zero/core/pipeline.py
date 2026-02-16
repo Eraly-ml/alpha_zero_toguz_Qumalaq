@@ -899,11 +899,16 @@ def eval_against_prev_ckpt(
     if env.winner is not None:
         if env.winner == env.black_player:
             winner, loser = black_elo, white_elo
+            winner.update_rating(loser.rating, 1)
+            loser.update_rating(winner.rating, 0)
         elif env.winner == env.white_player:
             winner, loser = white_elo, black_elo
-
-        winner.update_rating(loser.rating, 1)
-        loser.update_rating(winner.rating, 0)
+            winner.update_rating(loser.rating, 1)
+            loser.update_rating(winner.rating, 0)
+        else:
+            # Draw — each player scores 0.5
+            black_elo.update_rating(white_elo.rating, 0.5)
+            white_elo.update_rating(black_elo.rating, 0.5)
 
     stats['black_elo_rating'] = black_elo.rating
     stats['white_elo_rating'] = white_elo.rating
