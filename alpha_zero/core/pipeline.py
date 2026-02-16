@@ -466,6 +466,19 @@ def run_learner_loop(  # noqa: C901
     assert ckpt_dir is not None and os.path.exists(ckpt_dir) and os.path.isdir(ckpt_dir)
 
     set_seed(int(seed))
+
+    # Mixed precision training — BF16 on H100/Ampere+, FP16 on older GPUs
+    grad_scaler = None
+    amp_dtype = torch.float32
+    if device.type == 'cuda':
+        if torch.cuda.is_bf16_supported():
+            amp_dtype = torch.bfloat16
+            logger.info('Mixed precision training enabled with BF16 (H100/Ampere+)')
+        else:
+            amp_dtype = torch.float16
+            grad_scaler = torch.amp.GradScaler('cuda')
+            logger.info('Mixed precision training enabled with FP16')
+
     writer = CsvWriter(os.path.join(logs_dir, 'training.csv'), buffer_size=1)
     game_time_que = deque(maxlen=2000)
     game_length_que = deque(maxlen=2000)
@@ -607,10 +620,23 @@ def run_learner_loop(  # noqa: C901
                         continue
 
                     optimizer.zero_grad()
-                    pi_loss, v_loss = compute_losses(network, device, transitions, argument_data)
-                    loss = pi_loss + v_loss
-                    loss.backward()
-                    optimizer.step()
+                    if amp_dtype != torch.float32:
+                        with torch.amp.autocast('cuda', dtype=amp_dtype):
+                            pi_loss, v_loss = compute_losses(network, device, transitions, argument_data)
+                            loss = pi_loss + v_loss
+                        if grad_scaler is not None:
+                            grad_scaler.scale(loss).backward()
+                            grad_scaler.step(optimizer)
+                            grad_scaler.update()
+                        else:
+                            # BF16 path — no scaler needed
+                            loss.backward()
+                            optimizer.step()
+                    else:
+                        pi_loss, v_loss = compute_losses(network, device, transitions, argument_data)
+                        loss = pi_loss + v_loss
+                        loss.backward()
+                        optimizer.step()
                     lr_scheduler.step()
                     training_steps += 1
 

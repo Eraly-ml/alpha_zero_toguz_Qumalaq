@@ -24,6 +24,7 @@ flags.DEFINE_integer(
     128,
     'Number of hidden units in the linear layer of the neural network.',
 )
+flags.DEFINE_bool('use_se', False, 'Use Squeeze-and-Excitation attention in residual blocks.')
 
 flags.DEFINE_string(
     'black_ckpt',
@@ -83,6 +84,7 @@ def main():
             FLAGS.num_filters,
             FLAGS.num_fc_units,
             False,  # Not gomoku
+            use_se=FLAGS.use_se,
         )
 
     def load_checkpoint_for_net(network, ckpt_file, device):

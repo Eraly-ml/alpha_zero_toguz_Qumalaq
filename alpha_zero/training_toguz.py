@@ -19,7 +19,7 @@ from absl import flags
 
 import numpy as np
 import torch
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import MultiStepLR, CosineAnnealingLR
 
 FLAGS = flags.FLAGS
 flags.DEFINE_integer('num_stack', 4, 'Stack N previous states.')
@@ -64,6 +64,9 @@ flags.DEFINE_integer(
     int(1e5),
     'Number of training steps (measured in network parameter update, one batch is one training step).',
 )
+
+flags.DEFINE_bool('use_se', False, 'Use Squeeze-and-Excitation attention in residual blocks (recommended for H100).')
+flags.DEFINE_bool('cosine_lr', False, 'Use cosine annealing LR scheduler instead of multi-step decay.')
 
 flags.DEFINE_bool(
     'argument_data',
@@ -219,6 +222,7 @@ def main():
             FLAGS.num_filters,
             FLAGS.num_fc_units,
             False,  # Not gomoku
+            use_se=FLAGS.use_se,
         )
 
     network = network_builder()
@@ -228,7 +232,10 @@ def main():
         momentum=FLAGS.sgd_momentum,
         weight_decay=FLAGS.l2_regularization,
     )
-    lr_scheduler = MultiStepLR(optimizer, milestones=FLAGS.lr_milestones, gamma=FLAGS.lr_decay)
+    if FLAGS.cosine_lr:
+        lr_scheduler = CosineAnnealingLR(optimizer, T_max=FLAGS.max_training_steps, eta_min=1e-5)
+    else:
+        lr_scheduler = MultiStepLR(optimizer, milestones=FLAGS.lr_milestones, gamma=FLAGS.lr_decay)
 
     # Use the events to synchronize work between learner and actors.
     stop_event = mp.Event()
