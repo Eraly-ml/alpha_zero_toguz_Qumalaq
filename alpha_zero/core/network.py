@@ -39,12 +39,31 @@ def initialize_weights(net: nn.Module) -> None:
                 nn.init.zeros_(module.bias)
 
 
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation block for channel attention.
+    Not available in original AlphaZero (2017) — requires modern GPU memory/compute."""
+
+    def __init__(self, num_filters: int, reduction: int = 4) -> None:
+        super().__init__()
+        mid = max(num_filters // reduction, 1)
+        self.fc1 = nn.Linear(num_filters, mid)
+        self.fc2 = nn.Linear(mid, num_filters)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, _, _ = x.size()
+        y = x.mean(dim=(2, 3))  # global average pooling
+        y = F.relu(self.fc1(y))
+        y = torch.sigmoid(self.fc2(y))
+        return x * y.view(b, c, 1, 1)
+
+
 class ResNetBlock(nn.Module):
-    """Basic redisual block."""
+    """Residual block with optional Squeeze-and-Excitation attention."""
 
     def __init__(
         self,
         num_filters: int,
+        use_se: bool = False,
     ) -> None:
         super().__init__()
 
@@ -73,10 +92,14 @@ class ResNetBlock(nn.Module):
             nn.BatchNorm2d(num_features=num_filters),
         )
 
+        self.se = SEBlock(num_filters) if use_se else None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         out = self.conv_block1(x)
         out = self.conv_block2(out)
+        if self.se is not None:
+            out = self.se(out)
         out += residual
         out = F.relu(out)
         return out
@@ -93,6 +116,7 @@ class AlphaZeroNet(nn.Module):
         num_filters: int = 256,
         num_fc_units: int = 256,
         gomoku: bool = False,
+        use_se: bool = False,
     ) -> None:
         super().__init__()
         c, h, w = input_shape
@@ -121,7 +145,7 @@ class AlphaZeroNet(nn.Module):
         # Residual blocks
         res_blocks = []
         for _ in range(num_res_block):
-            res_blocks.append(ResNetBlock(num_filters))
+            res_blocks.append(ResNetBlock(num_filters, use_se=use_se))
         self.res_blocks = nn.Sequential(*res_blocks)
 
         self.policy_head = nn.Sequential(

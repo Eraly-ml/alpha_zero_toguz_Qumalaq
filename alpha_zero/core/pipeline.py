@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-torch.autograd.set_detect_anomaly(True)
+torch.backends.cudnn.benchmark = True
 
 import numpy as np
 from copy import copy, deepcopy
@@ -30,7 +30,6 @@ from copy import copy, deepcopy
 from alpha_zero.core.mcts_v2 import Node, parallel_uct_search, uct_search
 
 from alpha_zero.envs.base import BoardGameEnv
-from alpha_zero.core.eval_dataset import build_eval_dataset
 from alpha_zero.core.rating import EloRating
 from alpha_zero.core.replay import UniformReplay, Transition
 from alpha_zero.utils.csv_writer import CsvWriter
@@ -68,6 +67,31 @@ def load_from_file(file_name: str) -> Any:
     return pickle.load(open(file_name, 'rb'))
 
 
+def _unwrap_state_dict(state_dict):
+    """Strip '_orig_mod.' prefix from torch.compile'd state_dict keys."""
+    new_sd = {}
+    for k, v in state_dict.items():
+        new_sd[k.removeprefix('_orig_mod.')] = v
+    return new_sd
+
+
+def _load_state_dict_safe(network, state_dict):
+    """Load state_dict handling torch.compile prefix mismatch.
+
+    Saves always store raw (unwrapped) keys. When loading into a
+    compiled model we add the '_orig_mod.' prefix; when loading into
+    a plain model we strip it.
+    """
+    raw_sd = _unwrap_state_dict(state_dict)
+
+    # Check if network is a compiled (OptimizedModule) wrapper
+    if hasattr(network, '_orig_mod'):
+        wrapped_sd = {f'_orig_mod.{k}': v for k, v in raw_sd.items()}
+        network.load_state_dict(wrapped_sd)
+    else:
+        network.load_state_dict(raw_sd)
+
+
 def round_it(v, places=4) -> float:
     return round(v, places)
 
@@ -100,10 +124,11 @@ def create_mcts_player(
             state = state[None, ...]
 
         state = torch.from_numpy(state).to(dtype=torch.float32, device=device, non_blocking=True)
-        pi_logits, v = network(state)
+        with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+            pi_logits, v = network(state)
 
-        pi_logits = torch.detach(pi_logits)
-        v = torch.detach(v)
+        pi_logits = torch.detach(pi_logits).float()
+        v = torch.detach(v).float()
 
         pi = torch.softmax(pi_logits, dim=-1).cpu().numpy()
         v = v.cpu().numpy()
@@ -207,11 +232,19 @@ def run_selfplay_actor_loop(
 
     if load_ckpt is not None and os.path.exists(load_ckpt):
         loaded_state = torch.load(load_ckpt, map_location=device)
-        network.load_state_dict(loaded_state['network'])
+        _load_state_dict_safe(network, loaded_state['network'])
         training_steps = loaded_state['training_steps']
         logger.debug(f'Actor{rank} loaded state from checkpoint "{load_ckpt}"')
 
     network.eval()
+
+    # Compile network for faster inference (fuses BatchNorm+ReLU, uses CUDA graphs internally)
+    if device.type == 'cuda':
+        try:
+            network = torch.compile(network, mode='reduce-overhead')
+            logger.debug(f'Actor{rank} compiled network with reduce-overhead mode')
+        except Exception as e:
+            logger.debug(f'Actor{rank} torch.compile failed, using eager mode: {e}')
 
     # resign_threshold <= -1 means no resign
     resign_threshold = var_resign_threshold.value if env.has_resign_move else -1
@@ -232,7 +265,7 @@ def run_selfplay_actor_loop(
         new_ckpt = _decode_bytes(var_ckpt.value)
         if new_ckpt != '' and new_ckpt != last_ckpt and os.path.exists(new_ckpt):
             loaded_state = torch.load(new_ckpt, map_location=torch.device(device))
-            network.load_state_dict(loaded_state['network'])
+            _load_state_dict_safe(network, loaded_state['network'])
             training_steps = loaded_state['training_steps']
             network.eval()
             last_ckpt = new_ckpt
@@ -432,6 +465,19 @@ def run_learner_loop(  # noqa: C901
     assert ckpt_dir is not None and os.path.exists(ckpt_dir) and os.path.isdir(ckpt_dir)
 
     set_seed(int(seed))
+
+    # Mixed precision training — BF16 on H100/Ampere+, FP16 on older GPUs
+    grad_scaler = None
+    amp_dtype = torch.float32
+    if device.type == 'cuda':
+        if torch.cuda.is_bf16_supported():
+            amp_dtype = torch.bfloat16
+            logger.info('Mixed precision training enabled with BF16 (H100/Ampere+)')
+        else:
+            amp_dtype = torch.float16
+            grad_scaler = torch.amp.GradScaler('cuda')
+            logger.info('Mixed precision training enabled with FP16')
+
     writer = CsvWriter(os.path.join(logs_dir, 'training.csv'), buffer_size=1)
     game_time_que = deque(maxlen=2000)
     game_length_que = deque(maxlen=2000)
@@ -472,7 +518,7 @@ def run_learner_loop(  # noqa: C901
 
     if load_ckpt is not None and os.path.exists(load_ckpt):
         loaded_state = torch.load(load_ckpt, map_location=device)
-        network.load_state_dict(loaded_state['network'])
+        _load_state_dict_safe(network, loaded_state['network'])
         optimizer.load_state_dict(loaded_state['optimizer'])
         lr_scheduler.load_state_dict(loaded_state['lr_scheduler'])
         training_steps = loaded_state['training_steps']
@@ -573,10 +619,23 @@ def run_learner_loop(  # noqa: C901
                         continue
 
                     optimizer.zero_grad()
-                    pi_loss, v_loss = compute_losses(network, device, transitions, argument_data)
-                    loss = pi_loss + v_loss
-                    loss.backward()
-                    optimizer.step()
+                    if amp_dtype != torch.float32:
+                        with torch.amp.autocast('cuda', dtype=amp_dtype):
+                            pi_loss, v_loss = compute_losses(network, device, transitions, argument_data)
+                            loss = pi_loss + v_loss
+                        if grad_scaler is not None:
+                            grad_scaler.scale(loss).backward()
+                            grad_scaler.step(optimizer)
+                            grad_scaler.update()
+                        else:
+                            # BF16 path — no scaler needed
+                            loss.backward()
+                            optimizer.step()
+                    else:
+                        pi_loss, v_loss = compute_losses(network, device, transitions, argument_data)
+                        loss = pi_loss + v_loss
+                        loss.backward()
+                        optimizer.step()
                     lr_scheduler.step()
                     training_steps += 1
 
@@ -597,7 +656,7 @@ def run_learner_loop(  # noqa: C901
                 ckpt_file = os.path.join(ckpt_dir, f'training_steps_{training_steps}.ckpt')
                 torch.save(
                     {
-                        'network': network.state_dict(),
+                        'network': _unwrap_state_dict(network.state_dict()),
                         'optimizer': optimizer.state_dict(),
                         'lr_scheduler': lr_scheduler.state_dict(),
                         'training_steps': training_steps,
@@ -712,7 +771,7 @@ def run_evaluator_loop(
 
     if load_ckpt is not None and os.path.exists(load_ckpt):
         loaded_state = torch.load(load_ckpt, map_location=device)
-        network.load_state_dict(loaded_state['network'])
+        _load_state_dict_safe(network, loaded_state['network'])
         last_ckpt_step = loaded_state['training_steps']
         last_ckpt = load_ckpt
         logger.info(f'Evaluator loaded state from checkpoint "{load_ckpt}"')
@@ -722,16 +781,16 @@ def run_evaluator_loop(
     network.eval()
     prev_ckpt_network.eval()
 
+    # Compile eval networks for faster inference
+    if device.type == 'cuda':
+        try:
+            network = torch.compile(network, mode='reduce-overhead')
+            prev_ckpt_network = torch.compile(prev_ckpt_network, mode='reduce-overhead')
+            logger.debug('Evaluator compiled networks with reduce-overhead mode')
+        except Exception as e:
+            logger.debug(f'Evaluator torch.compile failed, using eager mode: {e}')
+
     dataloader = None
-    if eval_games_dir is not None and eval_games_dir != '' and os.path.exists(eval_games_dir):
-        eval_dataset = build_eval_dataset(eval_games_dir, env.num_stack, logger)
-        dataloader = DataLoader(
-            eval_dataset,
-            batch_size=1024,
-            pin_memory=True,
-            shuffle=False,
-            drop_last=False,
-        )
 
     # Create MCTS players for both players, note black always uses the latest checkpoint,
     # and white always uses the previous checkpoint
@@ -765,7 +824,7 @@ def run_evaluator_loop(
         # Load states from checkpoint file
         loaded_state = torch.load(ckpt_file, map_location=torch.device(device))
         training_steps = loaded_state['training_steps']
-        network.load_state_dict(loaded_state['network'])
+        _load_state_dict_safe(network, loaded_state['network'])
         network.eval()
         last_ckpt = ckpt_file
 
@@ -802,7 +861,7 @@ def run_evaluator_loop(
                 f.close()
 
         # Switching to new model
-        prev_ckpt_network.load_state_dict(loaded_state['network'])
+        _load_state_dict_safe(prev_ckpt_network, loaded_state['network'])
         prev_ckpt_network.eval()
         # We assume the new model will be the same level as previous model, since they are pretty close
         white_elo = deepcopy(black_elo)
@@ -856,11 +915,16 @@ def eval_against_prev_ckpt(
     if env.winner is not None:
         if env.winner == env.black_player:
             winner, loser = black_elo, white_elo
+            winner.update_rating(loser.rating, 1)
+            loser.update_rating(winner.rating, 0)
         elif env.winner == env.white_player:
             winner, loser = white_elo, black_elo
-
-        winner.update_rating(loser.rating, 1)
-        loser.update_rating(winner.rating, 0)
+            winner.update_rating(loser.rating, 1)
+            loser.update_rating(winner.rating, 0)
+        else:
+            # Draw — each player scores 0.5
+            black_elo.update_rating(white_elo.rating, 0.5)
+            white_elo.update_rating(black_elo.rating, 0.5)
 
     stats['black_elo_rating'] = black_elo.rating
     stats['white_elo_rating'] = white_elo.rating

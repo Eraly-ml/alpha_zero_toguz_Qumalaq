@@ -512,7 +512,7 @@ def parallel_uct_search(
     ```
 
     Args:
-        env: a gym like custom GoEnv environment.
+        env: a gym-like custom BoardGameEnv environment.
         eval_func: a evaluation function when called returns the
             action probabilities and predicted value from
             current player's perspective.
@@ -538,7 +538,7 @@ def parallel_uct_search(
 
     Raises:
         ValueError:
-            if input argument `env` is not valid GoEnv instance.
+            if input argument `env` is not valid BoardGameEnv instance.
             if input argument `num_simulations` is not a positive integer.
         RuntimeError:
             if the game is over.
@@ -576,7 +576,7 @@ def parallel_uct_search(
             node = root_node
 
             # Make sure do not touch the actual environment.
-            sim_env = copy.deepcopy(env)
+            sim_env = env.fast_clone() if hasattr(env, 'fast_clone') else copy.deepcopy(env)
             obs = sim_env.observation()
             done = sim_env.is_game_over()
 
