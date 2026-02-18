@@ -512,7 +512,7 @@ def parallel_uct_search(
     ```
 
     Args:
-        env: a gym like custom GoEnv environment.
+        env: a gym-like custom BoardGameEnv environment.
         eval_func: a evaluation function when called returns the
             action probabilities and predicted value from
             current player's perspective.
@@ -538,7 +538,7 @@ def parallel_uct_search(
 
     Raises:
         ValueError:
-            if input argument `env` is not valid GoEnv instance.
+            if input argument `env` is not valid BoardGameEnv instance.
             if input argument `num_simulations` is not a positive integer.
         RuntimeError:
             if the game is over.

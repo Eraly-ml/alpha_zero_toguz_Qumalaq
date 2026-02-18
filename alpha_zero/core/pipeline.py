@@ -30,7 +30,6 @@ from copy import copy, deepcopy
 from alpha_zero.core.mcts_v2 import Node, parallel_uct_search, uct_search
 
 from alpha_zero.envs.base import BoardGameEnv
-from alpha_zero.core.eval_dataset import build_eval_dataset
 from alpha_zero.core.rating import EloRating
 from alpha_zero.core.replay import UniformReplay, Transition
 from alpha_zero.utils.csv_writer import CsvWriter
@@ -792,15 +791,6 @@ def run_evaluator_loop(
             logger.debug(f'Evaluator torch.compile failed, using eager mode: {e}')
 
     dataloader = None
-    if eval_games_dir is not None and eval_games_dir != '' and os.path.exists(eval_games_dir):
-        eval_dataset = build_eval_dataset(eval_games_dir, env.num_stack, logger)
-        dataloader = DataLoader(
-            eval_dataset,
-            batch_size=1024,
-            pin_memory=True,
-            shuffle=False,
-            drop_last=False,
-        )
 
     # Create MCTS players for both players, note black always uses the latest checkpoint,
     # and white always uses the previous checkpoint
