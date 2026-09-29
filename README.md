@@ -2,6 +2,8 @@
 
 A PyTorch implementation of DeepMind's AlphaZero applied to **Togyz Kumalak** (Тоғыз Құмалақ) — a traditional Central Asian mancala board game.
 
+[Play](https://huggingface.co/spaces/Eraly-ml/togyz-kumalak-alphazero)
+
 Based on the AlphaZero framework from [The Art of Reinforcement Learning](https://link.springer.com/book/10.1007/978-1-4842-9606-6) by Michael Hu, adapted and extended for Togyz Kumalak.
 
 ---
